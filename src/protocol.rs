@@ -339,15 +339,21 @@ pub enum PrintJSON {
         data: Vec<JSONMessagePart>,
         message: String,
     },
-    Tutorial { data: Vec<JSONMessagePart> },
+    Tutorial {
+        data: Vec<JSONMessagePart>,
+    },
     TagsChanged {
         data: Vec<JSONMessagePart>,
         team: i32,
         slot: i32,
         tags: Vec<String>,
     },
-    CommandResult { data: Vec<JSONMessagePart> },
-    AdminCommandResult { data: Vec<JSONMessagePart> },
+    CommandResult {
+        data: Vec<JSONMessagePart>,
+    },
+    AdminCommandResult {
+        data: Vec<JSONMessagePart>,
+    },
     Goal {
         data: Vec<JSONMessagePart>,
         team: i32,
@@ -370,7 +376,7 @@ pub enum PrintJSON {
     #[serde(untagged)]
     Text {
         data: Vec<JSONMessagePart>,
-    }
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

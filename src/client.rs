@@ -1,13 +1,18 @@
 use crate::protocol::*;
-use futures_util::{
-    stream::{SplitSink, SplitStream},
-    SinkExt, Stream, StreamExt,
+use bytes::BytesMut;
+use ratchet_core::{Receiver, Sender, WebSocketStream};
+use ratchet_rs::deflate::{Deflate, DeflateDecoder, DeflateEncoder, DeflateExtProvider};
+use ratchet_rs::{
+    subscribe_with, ExtensionDecoder, Message, SubprotocolRegistry, UpgradedClient, WebSocketConfig,
 };
+use std::pin::Pin;
+use std::str::{from_utf8, Utf8Error};
+use std::task::{Context, Poll};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
-use tungstenite::protocol::Message;
-use tungstenite::Utf8Bytes;
+use tokio_native_tls::native_tls::TlsConnector;
+use tokio_native_tls::TlsStream;
 
 #[derive(Error, Debug)]
 pub enum ArchipelagoError {
@@ -23,42 +28,118 @@ pub enum ArchipelagoError {
     #[error("unexpected non-text result from websocket")]
     NonTextWebsocketResult(Message),
     #[error("network error")]
-    NetworkError(#[from] tungstenite::Error),
+    NetworkError(#[from] tokio::io::Error),
+    #[error("websocket error")]
+    WebSocketError(#[from] ratchet_rs::Error),
+    #[error("server sent invalid utf-8")]
+    InvalidUtf8Error(#[from] Utf8Error),
 }
 
-/**
- * A convenience layer to manage your connection to and communication with Archipelago
- */
+enum MaybeTlsStream {
+    Tls(TlsStream<TcpStream>),
+    Plain(TcpStream),
+}
+
+impl AsyncRead for MaybeTlsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MaybeTlsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        match self.get_mut() {
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_flush(cx),
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match self.get_mut() {
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+async fn try_connect_inner(host: &str, port: u16) -> Result<MaybeTlsStream, ArchipelagoError> {
+    // Attempt WSS, downgrade to WS if the TLS handshake fails
+    let mut stream = TcpStream::connect((host, port)).await?;
+    stream.set_nodelay(true)?;
+    if let Ok(cx) = TlsConnector::builder().build() {
+        let cx = tokio_native_tls::TlsConnector::from(cx);
+        if let Ok(stream) = cx.connect(host, stream).await {
+            return Ok(MaybeTlsStream::Tls(stream));
+        }
+
+        // even just ATTEMPTING the TLS stuff transfers ownership, and the Err branch doesn't give
+        // back the original stream, so I guess we have to open this all over again?
+        stream = TcpStream::connect((host, port)).await?;
+        stream.set_nodelay(true)?;
+    }
+
+    Ok(MaybeTlsStream::Plain(stream))
+}
+
+async fn try_connect(
+    host: &str,
+    port: u16,
+) -> Result<UpgradedClient<BufReader<BufWriter<MaybeTlsStream>>, Deflate>, ArchipelagoError> {
+    let stream = try_connect_inner(host, port).await?;
+    let url = format!(
+        "{}{}:{}",
+        match stream {
+            MaybeTlsStream::Plain(_) => "ws://",
+            MaybeTlsStream::Tls(_) => "wss://",
+        },
+        host,
+        port
+    );
+    Ok(subscribe_with(
+        WebSocketConfig::default(),
+        BufReader::new(BufWriter::new(stream)),
+        url,
+        &DeflateExtProvider::default(),
+        SubprotocolRegistry::default(),
+    )
+    .await?)
+}
+
 pub struct ArchipelagoClient {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    room_info: RoomInfo,
-    message_buffer: Vec<ServerMessage>,
-    data_package: Option<DataPackageObject>,
+    sender: ArchipelagoClientSender,
+    receiver: ArchipelagoClientReceiver,
 }
 
 impl ArchipelagoClient {
     /**
      * Create an instance of the client and connect to the server on the given URL
      */
-    pub async fn new(url: &str) -> Result<ArchipelagoClient, ArchipelagoError> {
-        // Attempt WSS, downgrade to WS if the TLS handshake fails
-        let mut wss_url = String::new();
-        wss_url.push_str("wss://");
-        wss_url.push_str(url);
-        let (mut ws, _) = match connect_async(&wss_url).await {
-            Ok(result) => result,
-            Err(tungstenite::error::Error::Tls(_)) => {
-                let mut ws_url = String::new();
-                ws_url.push_str("ws://");
-                ws_url.push_str(url);
-                connect_async(&ws_url).await?
-            }
-            Err(error) => return Err(ArchipelagoError::NetworkError(error)),
-        };
+    pub async fn new(host: &str, port: u16) -> Result<ArchipelagoClient, ArchipelagoError> {
+        let (sender, mut receiver) = try_connect(host, port).await?.websocket.split()?;
 
-        let response = recv_messages(&mut ws)
-            .await
-            .ok_or(ArchipelagoError::ConnectionClosed)??;
+        let mut buf = BytesMut::new();
+        let response = recv(&mut receiver, &mut buf).await?;
         let mut iter = response.into_iter();
         let room_info = match iter.next() {
             Some(ServerMessage::RoomInfo(room)) => room,
@@ -72,10 +153,14 @@ impl ArchipelagoClient {
         };
 
         Ok(ArchipelagoClient {
-            ws,
-            room_info,
-            message_buffer: iter.collect(),
-            data_package: None,
+            sender: ArchipelagoClientSender { ws: sender },
+            receiver: ArchipelagoClientReceiver {
+                ws: receiver,
+                room_info,
+                data_package: None,
+                message_buffer: iter.collect(),
+                buf,
+            },
         })
     }
 
@@ -84,14 +169,16 @@ impl ArchipelagoClient {
      * Package
      */
     pub async fn with_data_package(
-        url: &str,
+        host: &str,
+        port: u16,
         mut games: Option<Vec<String>>,
     ) -> Result<ArchipelagoClient, ArchipelagoError> {
-        let mut client = Self::new(url).await?;
+        let mut client = Self::new(host, port).await?;
         if games.is_none() {
             // If None, request the games that are part of the connected room.
             let mut list: Vec<String> = vec![];
             client
+                .receiver
                 .room_info
                 .datapackage_checksums
                 .keys()
@@ -103,36 +190,29 @@ impl ArchipelagoClient {
         client
             .send(ClientMessage::GetDataPackage(GetDataPackage { games }))
             .await?;
-        let response = client.recv().await?;
-        match response {
-            Some(ServerMessage::DataPackage(pkg)) => client.data_package = Some(pkg.data),
-            Some(received) => {
+        match client.recv().await? {
+            ServerMessage::DataPackage(pkg) => client.receiver.data_package = Some(pkg.data),
+            received => {
                 return Err(ArchipelagoError::IllegalResponse {
                     received,
                     expected: "DataPackage",
                 })
             }
-            None => return Err(ArchipelagoError::ConnectionClosed),
         }
 
         Ok(client)
     }
 
     pub fn room_info(&self) -> &RoomInfo {
-        &self.room_info
+        &self.receiver.room_info
     }
 
     pub fn data_package(&self) -> Option<&DataPackageObject> {
-        self.data_package.as_ref()
+        self.receiver.data_package.as_ref()
     }
 
     pub async fn send(&mut self, message: ClientMessage) -> Result<(), ArchipelagoError> {
-        let request = serde_json::to_string(&[message])?;
-        self.ws
-            .send(Message::Text(Utf8Bytes::from(request)))
-            .await?;
-
-        Ok(())
+        self.sender.send(message).await
     }
 
     /**
@@ -141,20 +221,8 @@ impl ArchipelagoClient {
      * Will buffer results locally, and return results from buffer or wait on network
      * if buffer is empty
      */
-    pub async fn recv(&mut self) -> Result<Option<ServerMessage>, ArchipelagoError> {
-        if let Some(message) = self.message_buffer.pop() {
-            return Ok(Some(message));
-        }
-        let messages = recv_messages(&mut self.ws).await;
-        if let Some(result) = messages {
-            let mut messages = result?;
-            messages.reverse();
-            let first = messages.pop();
-            self.message_buffer = messages;
-            Ok(first)
-        } else {
-            Ok(None)
-        }
+    pub async fn recv(&mut self) -> Result<ServerMessage, ArchipelagoError> {
+        self.receiver.recv().await
     }
 
     /**
@@ -182,10 +250,7 @@ impl ArchipelagoClient {
             request_slot_data: true,
         }))
         .await?;
-        let response = self
-            .recv()
-            .await?
-            .ok_or(ArchipelagoError::ConnectionClosed)?;
+        let response = self.recv().await?;
 
         match response {
             ServerMessage::Connected(connected) => Ok(connected),
@@ -214,14 +279,17 @@ impl ArchipelagoClient {
      */
     pub async fn sync(&mut self) -> Result<ReceivedItems, ArchipelagoError> {
         self.send(ClientMessage::Sync).await?;
-        while let Some(response) = self.recv().await? {
-            match response {
-                ServerMessage::ReceivedItems(items) => return Ok(items),
-                resp => self.message_buffer.push(resp),
+        let mut ignored_messages = vec![];
+        let items = loop {
+            match self.recv().await? {
+                ServerMessage::ReceivedItems(items) => break items,
+                resp => ignored_messages.push(resp),
             }
-        }
+        };
 
-        Err(ArchipelagoError::ConnectionClosed)
+        ignored_messages.reverse();
+        self.receiver.message_buffer.extend(ignored_messages);
+        Ok(items)
     }
 
     /**
@@ -250,14 +318,17 @@ impl ArchipelagoClient {
             create_as_hint,
         }))
         .await?;
-        while let Some(response) = self.recv().await? {
-            match response {
-                ServerMessage::LocationInfo(items) => return Ok(items),
-                resp => self.message_buffer.push(resp),
+        let mut ignored_messages = vec![];
+        let items = loop {
+            match self.recv().await? {
+                ServerMessage::LocationInfo(items) => break items,
+                resp => ignored_messages.push(resp),
             }
-        }
+        };
 
-        Err(ArchipelagoError::ConnectionClosed)
+        ignored_messages.reverse();
+        self.receiver.message_buffer.extend(ignored_messages);
+        Ok(items)
     }
 
     /**
@@ -299,14 +370,17 @@ impl ArchipelagoClient {
      */
     pub async fn get(&mut self, keys: Vec<String>) -> Result<Retrieved, ArchipelagoError> {
         self.send(ClientMessage::Get(Get { keys })).await?;
-        while let Some(response) = self.recv().await? {
-            match response {
-                ServerMessage::Retrieved(items) => return Ok(items),
-                resp => self.message_buffer.push(resp),
+        let mut ignored_messages = vec![];
+        let items = loop {
+            match self.recv().await? {
+                ServerMessage::Retrieved(items) => break items,
+                resp => ignored_messages.push(resp),
             }
-        }
+        };
 
-        Err(ArchipelagoError::ConnectionClosed)
+        ignored_messages.reverse();
+        self.receiver.message_buffer.extend(ignored_messages);
+        Ok(items)
     }
 
     /**
@@ -328,40 +402,17 @@ impl ArchipelagoClient {
             operations,
         }))
         .await?;
-        while let Some(response) = self.recv().await? {
-            match response {
-                ServerMessage::SetReply(items) => return Ok(items),
-                resp => self.message_buffer.push(resp),
+        let mut ignored_messages = vec![];
+        let items = loop {
+            match self.recv().await? {
+                ServerMessage::SetReply(items) => break items,
+                resp => ignored_messages.push(resp),
             }
-        }
+        };
 
-        Err(ArchipelagoError::ConnectionClosed)
-    }
-
-    /**
-     * Split the client into two parts, one to handle sending and one to handle receiving.
-     *
-     * This removes access to a few convenience methods (like `get` or `set`) because it's
-     * there's now extra coordination required to match a read and write, but it brings
-     * the benefits of allowing simultaneous reading and writing.
-     */
-    pub fn split(self) -> (ArchipelagoClientSender, ArchipelagoClientReceiver) {
-        let Self {
-            ws,
-            room_info,
-            message_buffer,
-            data_package,
-        } = self;
-        let (send, recv) = ws.split();
-        (
-            ArchipelagoClientSender { ws: send },
-            ArchipelagoClientReceiver {
-                ws: recv,
-                room_info,
-                message_buffer,
-                data_package,
-            },
-        )
+        ignored_messages.reverse();
+        self.receiver.message_buffer.extend(ignored_messages);
+        Ok(items)
     }
 }
 
@@ -373,16 +424,14 @@ impl ArchipelagoClient {
  * use `send`.
  */
 pub struct ArchipelagoClientSender {
-    ws: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    ws: Sender<BufReader<BufWriter<MaybeTlsStream>>, DeflateEncoder>,
 }
 
 impl ArchipelagoClientSender {
     pub async fn send(&mut self, message: ClientMessage) -> Result<(), ArchipelagoError> {
-        let request = serde_json::to_string(&[message])?;
         self.ws
-            .send(Message::Text(Utf8Bytes::from(request)))
+            .write_text(serde_json::to_string(&[message])?)
             .await?;
-
         Ok(())
     }
 
@@ -432,27 +481,40 @@ impl ArchipelagoClientSender {
  * use `recv`.
  */
 pub struct ArchipelagoClientReceiver {
-    ws: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    ws: Receiver<BufReader<BufWriter<MaybeTlsStream>>, DeflateDecoder>,
     room_info: RoomInfo,
     message_buffer: Vec<ServerMessage>,
     data_package: Option<DataPackageObject>,
+    buf: BytesMut,
+}
+
+async fn recv<S: WebSocketStream, E: ExtensionDecoder>(
+    s: &mut Receiver<S, E>,
+    buf: &mut BytesMut,
+) -> Result<Vec<ServerMessage>, ArchipelagoError> {
+    loop {
+        match s.read(buf).await {
+            Ok(Message::Text) => {
+                let payload = serde_json::from_str::<Vec<ServerMessage>>(from_utf8(buf.as_ref())?)?;
+                buf.clear();
+                break Ok(payload);
+            }
+            Ok(Message::Ping(_) | Message::Pong(_)) => {}
+            Ok(Message::Close(_)) => break Err(ArchipelagoError::ConnectionClosed),
+            Ok(msg) => break Err(ArchipelagoError::NonTextWebsocketResult(msg)),
+            Err(e) => break Err(e.into()),
+        }
+    }
 }
 
 impl ArchipelagoClientReceiver {
-    pub async fn recv(&mut self) -> Result<Option<ServerMessage>, ArchipelagoError> {
-        if let Some(message) = self.message_buffer.pop() {
-            return Ok(Some(message));
+    pub async fn recv(&mut self) -> Result<ServerMessage, ArchipelagoError> {
+        while self.message_buffer.is_empty() {
+            self.message_buffer = recv(&mut self.ws, &mut self.buf).await?;
+            self.message_buffer.reverse();
         }
-        let messages = recv_messages(&mut self.ws).await;
-        if let Some(result) = messages {
-            let mut messages = result?;
-            messages.reverse();
-            let first = messages.pop();
-            self.message_buffer = messages;
-            Ok(first)
-        } else {
-            Ok(None)
-        }
+
+        Ok(self.message_buffer.pop().unwrap())
     }
 
     pub fn room_info(&self) -> &RoomInfo {
@@ -461,22 +523,5 @@ impl ArchipelagoClientReceiver {
 
     pub fn data_package(&self) -> Option<&DataPackageObject> {
         self.data_package.as_ref()
-    }
-}
-
-async fn recv_messages(
-    mut ws: impl Stream<Item = Result<Message, tungstenite::error::Error>> + Unpin,
-) -> Option<Result<Vec<ServerMessage>, ArchipelagoError>> {
-    match ws.next().await? {
-        Ok(Message::Text(response)) => {
-            Some(serde_json::from_str::<Vec<ServerMessage>>(&response).map_err(|e| {
-                log::error!("Errored message: {}", response);
-                e.into() 
-            }))
-        }
-        Ok(Message::Close(_)) => Some(Err(ArchipelagoError::ConnectionClosed)),
-        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => None,
-        Ok(msg) => Some(Err(ArchipelagoError::NonTextWebsocketResult(msg))),
-        Err(e) => Some(Err(e.into())),
     }
 }

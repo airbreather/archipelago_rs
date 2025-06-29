@@ -1,12 +1,14 @@
 use archipelago_rs::client::ArchipelagoClient;
 use std::io::{self, BufRead};
+use std::str::FromStr;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     // Connect to AP server
     let server = prompt("Connect to what AP server?")?;
+    let (host, port) = server.split_once(':').unwrap();
 
-    let mut client = ArchipelagoClient::new(&server).await?;
+    let mut client = ArchipelagoClient::new(&host, u16::from_str(port).unwrap()).await?;
     println!("Connected!");
 
     // Connect to a given slot on the server

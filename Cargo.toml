@@ -10,13 +10,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_repr = "0.1"
 thiserror = "2.0.12"
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio = "1.45.0"
-# https://github.com/SvizelPritula/tungstenite-rs/tree/permessage-deflate 
-# Switch tungstenite to the above if you need compressed websockets. Maybe this'll get merged in the future
-tokio-tungstenite = { version = "0.26.2", features = ["native-tls"] }
-tungstenite = "0.26.2"
-log = { version = "0.4.27" }
+tokio-native-tls = "0.3.1"
+bytes = "1.10.1"
+ratchet_core = { version = "1.2.1", features = ["split"] }
+ratchet_rs = { version = "1.2.1", features = ["deflate", "split"] }
 
 [dev-dependencies]
 anyhow = "1.0"
