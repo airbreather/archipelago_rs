@@ -127,8 +127,8 @@ async fn try_connect(
 }
 
 pub struct ArchipelagoClient {
-    sender: ArchipelagoClientSender,
-    receiver: ArchipelagoClientReceiver,
+    pub sender: ArchipelagoClientSender,
+    pub receiver: ArchipelagoClientReceiver,
 }
 
 impl ArchipelagoClient {
