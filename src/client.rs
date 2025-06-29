@@ -5,8 +5,9 @@ use futures_util::{
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
-use tungstenite::protocol::Message;
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
+use tungstenite::extensions::DeflateConfig;
+use tungstenite::protocol::{Message, WebSocketConfig};
 use tungstenite::Utf8Bytes;
 
 #[derive(Error, Debug)]
@@ -45,13 +46,15 @@ impl ArchipelagoClient {
         let mut wss_url = String::new();
         wss_url.push_str("wss://");
         wss_url.push_str(url);
-        let (mut ws, _) = match connect_async(&wss_url).await {
+        let mut config = WebSocketConfig::default();
+        config.compression = Some(DeflateConfig::default());
+        let (mut ws, _) = match connect_async_with_config(&wss_url, Some(config), false).await {
             Ok(result) => result,
             Err(tungstenite::error::Error::Tls(_)) => {
                 let mut ws_url = String::new();
                 ws_url.push_str("ws://");
                 ws_url.push_str(url);
-                connect_async(&ws_url).await?
+                connect_async_with_config(&ws_url, Some(config), false).await?
             }
             Err(error) => return Err(ArchipelagoError::NetworkError(error)),
         };
