@@ -1,6 +1,6 @@
 use crate::protocol::*;
 use bytes::BytesMut;
-use ratchet_core::{Receiver, Sender, WebSocketStream};
+use ratchet_core::{CloseReason, Receiver, Sender, WebSocketStream};
 use ratchet_rs::deflate::{Deflate, DeflateDecoder, DeflateEncoder, DeflateExtProvider};
 use ratchet_rs::{
     subscribe_with, ExtensionDecoder, Message, SubprotocolRegistry, UpgradedClient, WebSocketConfig,
@@ -259,6 +259,12 @@ impl ArchipelagoClient {
                 expected: "Connected",
             }),
         }
+    }
+
+    /// Disconnect from the room
+    pub async fn disconnect(&mut self, close_reason: CloseReason) -> Result<(), ArchipelagoError> {
+        self.sender.ws.close(close_reason).await?;
+        Ok(())
     }
 
     /**
